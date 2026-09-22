@@ -1,6 +1,7 @@
 [project]
 name = "open-banking-gateway-python"
 version = "0.1.0"
+description = "本地可运行的多租户开放银行 API 接入层：凭证/令牌校验、同意状态机、限流配额、回调幂等投递与审计"
 requires-python = ">=3.14.4"
 dependencies = [
     "fastapi[standard]>=0.141.1",
