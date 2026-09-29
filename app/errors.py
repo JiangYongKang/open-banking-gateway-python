@@ -143,3 +143,37 @@ class ConsentNotAuthorisedError(ConsentAccessError):
 
 class CallbackPayloadTooLargeError(PayloadTooLargeError):
     code = "callback_payload_too_large"
+
+
+# ---- 同意变更（amendment）----------------------------------------------
+
+class ConsentAmendmentNotFoundError(NotFoundError):
+    code = "consent_amendment_not_found"
+
+
+class ConsentAmendmentConflictError(ConsentStateError):
+    """已存在未决变更 / 变更无实际改动 等冲突。"""
+
+    code = "consent_amendment_conflict"
+
+
+class ConsentAmendmentVoidError(ConsentStateError):
+    """变更单已作废（同意被撤销/到期），不能再批准。"""
+
+    code = "consent_amendment_void"
+
+
+# ---- 请求级幂等 ---------------------------------------------------------
+
+class IdempotencyConflictError(GatewayError):
+    """同一 request_id 以不同的请求内容重复提交。"""
+
+    code = "idempotency_conflict"
+    status_code = 409
+
+
+class IdempotencyInProgressError(GatewayError):
+    """同一 request_id 的另一请求（通常来自另一进程）仍在处理中。"""
+
+    code = "idempotency_in_progress"
+    status_code = 409

@@ -18,6 +18,9 @@ from .audit import AuditLog
 from .callbacks import CallbackDispatcher
 from .config import Settings
 from .consents import ConsentService
+from .amendments import AmendmentService
+from .batch import BatchService
+from .insights import InsightService
 from .ratelimit import LimitConfig, RateLimiter
 from .storage import LocalStore
 from .tenants import TenantRegistry
@@ -111,6 +114,11 @@ class Gateway:
         self.audit = AuditLog(self.store, clock=clock)
         self.registry = TenantRegistry(self.store, self.audit, clock=clock)
         self.consents = ConsentService(self.store, self.audit, clock=clock)
+        self.amendments = AmendmentService(
+            self.store, self.audit, self.consents, clock=clock
+        )
+        # 同意终态化时，同事务作废挂在其上的待生效变更
+        self.consents.amendment_void_hook = self.amendments.void_pending_in_tx
         self.limiter = RateLimiter(self.store, clock=clock)
         self.sender = LocalWebhookSender(self.store, timeout=settings.upstream_timeout_seconds)
         self.callbacks = CallbackDispatcher(
@@ -121,6 +129,10 @@ class Gateway:
             backoff_base=settings.callback_backoff_base_seconds,
             backoff_factor=settings.callback_backoff_factor,
         )
+        self.batch = BatchService(
+            self.store, self.consents, self.amendments, self.audit, self.callbacks, clock=clock
+        )
+        self.insights = InsightService(self.store)
         self.bank = MockBankService(timeout=settings.upstream_timeout_seconds)
         self._retry_thread: threading.Thread | None = None
         self._stop = threading.Event()

@@ -78,6 +78,27 @@ class ReceiveIn(BaseModel):
     payload: dict
 
 
+class AmendRequestIn(BaseModel):
+    add_scopes: list[str] = Field(default_factory=list)
+    extend_seconds: float | None = None
+
+
+class BatchActionIn(BaseModel):
+    action: str
+    consent_id: str | None = None
+    amendment_id: str | None = None
+    resource: str | None = None
+    scopes: list[str] | None = None
+    ttl_seconds: float | None = None
+    add_scopes: list[str] | None = None
+    extend_seconds: float | None = None
+
+
+class BatchIn(BaseModel):
+    request_id: str = Field(min_length=1, max_length=128)
+    actions: list[BatchActionIn] = Field(min_length=1, max_length=100)
+
+
 def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
     settings = settings or load_settings()
     from .runtime import Gateway
@@ -259,6 +280,28 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
         return gw.consents.get(tenant_id, consent_id)
 
     @application.post(
+        "/admin/tenants/{tenant_id}/consents/{consent_id}/amendments",
+        dependencies=[Depends(require_admin)],
+    )
+    def admin_request_amendment(tenant_id: str, consent_id: str, body: AmendRequestIn):
+        return gw.amendments.request(
+            tenant_id, consent_id,
+            add_scopes=body.add_scopes, extend_seconds=body.extend_seconds,
+        )
+
+    @application.post(
+        "/admin/tenants/{tenant_id}/amendments/{amendment_id}/approve",
+        dependencies=[Depends(require_admin)],
+    )
+    def admin_approve_amendment(tenant_id: str, amendment_id: str):
+        rec = gw.amendments.approve(tenant_id, amendment_id)
+        gw.callbacks.trigger(
+            f"evt-amendment-{amendment_id}", tenant_id, "consent.amendment_approved",
+            {"consent_id": rec["consent_id"], "amendment_id": amendment_id},
+        )
+        return rec
+
+    @application.post(
         "/admin/tenants/{tenant_id}/expire-consents", dependencies=[Depends(require_admin)]
     )
     def admin_expire(tenant_id: str):
@@ -368,6 +411,48 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
     ):
         _authenticate("usage:read", x_tenant_id, x_api_key, authorization)
         return gw.limiter.usage(tenant_id, endpoint, gw.default_limits())
+
+    @application.post("/t/{tenant_id}/consents/batch")
+    def consent_batch(
+        tenant_id: str,
+        body: BatchIn,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """合作方批量提交同意动作（创建/授权/撤销/变更混合），按 request_id 幂等。"""
+        principal = _authenticate(
+            "consents:write", x_tenant_id, x_api_key, authorization
+        )
+        if principal.tenant_id != tenant_id:
+            raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
+        endpoint = "POST /consents/batch"
+        actions = [a.model_dump(exclude_none=True) for a in body.actions]
+        fingerprint = gw.batch.fingerprint(actions)
+        # 幂等重放直接返回首次结果：不进限流守卫，不重复扣额度/发回调/改状态
+        replay = gw.batch.replay_result(tenant_id, body.request_id, fingerprint)
+        if replay is not None:
+            return replay
+        return _guarded(
+            tenant_id, endpoint,
+            lambda: gw.batch.submit(tenant_id, body.request_id, actions),
+        )
+
+    @application.get("/t/{tenant_id}/consents/{consent_id}/insight")
+    def consent_insight(
+        tenant_id: str,
+        consent_id: str,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """合作方自助只读：本同意近期访问结论 + 关联回调投递。纯读、不占用量。"""
+        principal = _authenticate(
+            "consents:read", x_tenant_id, x_api_key, authorization
+        )
+        if principal.tenant_id != tenant_id:
+            raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
+        return gw.insights.consent_insight(tenant_id, consent_id)
 
     return application
 

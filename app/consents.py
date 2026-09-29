@@ -38,13 +38,20 @@ class ConsentService:
         self._store = store
         self._audit = audit
         self._clock = clock
+        # 由 runtime 注入：同意进入终态时在同事务内作废待生效变更
+        self.amendment_void_hook = None
 
     # ---- 内部：事务内流转 ------------------------------------------------
 
     def _transition(self, tenant_id: str, consent_id: str, target: ConsentStatus, action: str) -> dict:
         now = self._clock()
+        coll_names = ["consents", "audit"]
+        if self.amendment_void_hook is not None and target in (
+            ConsentStatus.REVOKED, ConsentStatus.EXPIRED
+        ):
+            coll_names.append("amendments")
 
-        def _tx(consents, audit):
+        def _tx(consents, audit, amendments=None):
             rec = consents.get(consent_id)
             if rec is None or rec["tenant_id"] != tenant_id:
                 # 注意：先校验归属，不泄漏其它租户同意是否存在
@@ -75,6 +82,14 @@ class ConsentService:
                 rec["revoked_at"] = now
             elif target is ConsentStatus.EXPIRED:
                 rec["expires_at"] = now
+            # 变更待生效期间同意终态化：同一事务内把待生效变更作废，
+            # 保证“先撤销/到期，后批准”绝不可能让新作用域生效。
+            voided: list[str] = []
+            if amendments is not None and self.amendment_void_hook is not None:
+                reason = "consent_revoked" if target is ConsentStatus.REVOKED else "consent_expired"
+                voided = self.amendment_void_hook(
+                    consents, amendments, audit, consent_id, reason, now
+                )
             consents.put(consent_id, rec)
             if self._audit is not None:
                 eid, entry = make_entry(
@@ -82,13 +97,13 @@ class ConsentService:
                     tenant_id=tenant_id,
                     result="state_change",
                     detail={"consent_id": consent_id, "from": current.value, "to": target.value,
-                            "version": rec["version"]},
+                            "version": rec["version"], "amendments_voided": voided},
                     clock=self._clock,
                 )
                 audit.put(eid, entry)
             return rec
 
-        return self._store.atomic(["consents", "audit"], _tx)
+        return self._store.atomic(coll_names, _tx)
 
     # ---- 公开 API --------------------------------------------------------
 
@@ -119,6 +134,7 @@ class ConsentService:
             "authorised_at": None,
             "expires_at": None,
             "revoked_at": None,
+            "versions": [],
             "history": [{"ts": now, "from": None, "to": ConsentStatus.PENDING.value,
                          "action": "create"}],
         }

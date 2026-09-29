@@ -23,6 +23,14 @@ class CallbackStatus(enum.Enum):
     FAILED = "failed"
 
 
+class AmendmentStatus(enum.Enum):
+    """同意变更单自身的状态：待生效 / 已批准生效 / 已作废。"""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    VOID = "void"
+
+
 @dataclass
 class ApiKey:
     key_id: str

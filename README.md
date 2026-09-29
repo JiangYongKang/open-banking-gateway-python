@@ -118,6 +118,93 @@ PENDING ──authorise──▶ AUTHORISED ──revoke──▶ REVOKED   (终
 | 同意不含所需 scope | `consent_scope_missing` |
 | 同意不属于该租户 | `consent_not_found`（不泄漏存在性） |
 
+### 3.1 同意变更（追加作用域 / 延长有效期）
+
+对**已授权生效**的同意，合作方可以申请变更；变更走独立的「变更单」两阶段流程，
+不直接改动正在使用的授权：
+
+```
+POST /admin/tenants/{tid}/consents/{cid}/amendments
+     {"add_scopes": ["payments:write"], "extend_seconds": 3600}
+# => amendment_id，变更单进入 pending（待生效）
+
+POST /admin/tenants/{tid}/amendments/{amendment_id}/approve   # 批准后才生效
+```
+
+规则（关键业务承诺）：
+
+- **待生效期间一切照旧**：申请提交后、批准之前，同意的 `scopes` / `expires_at`
+  不变、`version` 不增，资源访问闸门继续按当前生效版本放行，正在跑的业务不会被打断；
+  即使变更里申请了新 scope，批准前用新 scope 访问仍得到 `consent_scope_missing`。
+- **批准在单一跨集合事务内原子生效**：旧版本（scopes / expires_at / ttl / 版本号 /
+  被哪个变更替换）完整快照写入同意的 `versions` 版本链，同意与变更单各自的
+  `history` 都只增不改，旧版本永不被覆盖或丢失。
+- 作用域变更按**并集去重**（不会丢旧作用域）；延期锚定「申请时的当前到期点 +
+  extend_seconds」，审批延迟不会缩短有效期。仅延长有效期时 `ttl_seconds` 随之重算。
+- **变更与撤销/到期撞车按最终状态算**：待生效期间同意被撤销或到期，变更单在
+  **同一事务**内被置为 `void`（`void_reason = consent_revoked | consent_expired`），
+  之后批准显式返回 `consent_amendment_void` / 409；撤销/到期之后任何 scope
+  （包括申请追加的新 scope）都不可再读写。
+- 同一同意同时只允许一个 `pending` 变更（`consent_amendment_conflict`）；
+  对非 AUTHORISED 同意申请变更、申请无任何实际改动（scope 已包含且未延期）同样返回
+  `consent_amendment_conflict`；重复批准是幂等的，不会产生第二个新版本。
+
+## 3b. 同意动作批量提交与请求级幂等
+
+合作方在业务面一次提交多条同意动作（`create` / `authorise` / `revoke` /
+`amend_request` / `amend_approve` 可混合），并携带自己生成的 `request_id`：
+
+```
+POST /t/{tid}/consents/batch            # 需 scope: consents:write
+{
+  "request_id": "partner-uuid-0001",
+  "actions": [
+    {"action": "create", "resource": "acct-1",
+     "scopes": ["accounts:read"], "ttl_seconds": 3600},
+    {"action": "authorise", "consent_id": "consent-..."},
+    {"action": "amend_request", "consent_id": "consent-...",
+     "add_scopes": ["payments:write"], "extend_seconds": 1800},
+    {"action": "amend_approve", "consent_id": "consent-...",
+     "amendment_id": "amend-..."},
+    {"action": "revoke", "consent_id": "consent-..."}
+  ]
+}
+```
+
+幂等约定与适用范围：
+
+- 幂等作用域为 **租户 + request_id**（不同租户可复用相同字符串）。同一标识重复提交
+  **只在首次执行一次**，之后返回与首次**逐字节一致**的逐项结果，且：
+  **不重复扣限流/配额、不重复触发回调、不重复改变状态**（重放请求在限流守卫之前短路）。
+- 同一 `request_id` 但请求内容（动作列表）不同 → `idempotency_conflict` / 409；
+  跨进程同时撞上仍在处理的首请求 → `idempotency_in_progress` / 409（不会执行第二次）。
+- **逐项独立结果**：响应 `results[]` 每项带 `index / action / ok / consent_id /
+  amendment_id / error{code,message}`，并给 `summary{total,succeeded,failed}`。
+  单项非法（如对已撤销同意做变更 → `consent_amendment_conflict`、操作不存在的同意 →
+  `consent_not_found`、未知动作 → `validation_error`）只让该一项失败并被整体回滚，
+  不影响其它项，也**不会留下建了一半/算了一半的残留状态**。
+- 单批最多 100 个动作；整批占用一次业务面限流配额（按接口
+  `POST /consents/batch` 计），而不是按动作条数计；幂等重放占用 0 次。
+- HTTP 层要求 scope `consents:write`；请求级幂等仅适用于该批量端点
+  （回调的 `event_id` 幂等仍是各自独立的机制）。
+
+## 3c. 合作方自助查询（只读）
+
+```
+GET /t/{tid}/consents/{cid}/insight     # 需 scope: consents:read
+```
+
+返回该同意的：当前概要（状态/作用域/各时间戳/版本）、`pending_amendment`
+（若有待生效变更，含其目标作用域与目标到期点）、`recent_access[]`（近期**放行**
+与各类**拒绝原因**：`revoked / expired / not_authorised / resource_mismatch /
+scope_missing`，按时间倒序、默认最近 50 条）以及 `callbacks[]`（与该同意关联的
+回调投递：授权、撤销、变更批准事件的投递状态/尝试次数/最后错误）。
+
+- **严格租户隔离**：只能查本租户名下同意；查询他人同意与查询不存在的同意返回
+  完全同形的 `consent_not_found` / 404，不泄漏存在性。
+- **纯只读、零副作用**：该接口不写业务、不写审计、不经过限流配额，因此不会影响
+  正常业务（如 `GET /accounts/{id}`）的用量口径（测试对查询前后计数做了断言）。
+
 ## 4. 限流与配额规则
 
 按 **租户 + 接口** 两级滑动窗口计数：
@@ -169,11 +256,35 @@ PENDING ──authorise──▶ AUTHORISED ──revoke──▶ REVOKED   (终
 ## 8. 本地验证方法
 
 ```bash
-# 全部单测（27 个）：异常链路 + 并发竞争 + 真实本地 HTTP 回环
+# 全部单测（61 个）：异常链路 + 并发竞争 + 多进程幂等 + 真实本地 HTTP 回环
 uv run python -m unittest discover -s tests -v
+
+# 只跑本次新增能力
+uv run python -m unittest tests.test_09_consent_amendments \
+    tests.test_10_batch_idempotency tests.test_11_consent_insights \
+    tests.test_12_amendment_races -v
 
 # 交互式演示
 ./scripts/demo.sh 8090
+```
+
+手工快速验证（服务起在 8090 后）：
+
+```bash
+A="X-Admin-Token: local-admin"
+# 1) 创建并授权同意
+CID=$(curl -s -X POST localhost:8090/admin/tenants/acme/consents -H "$A" -H 'Content-Type: application/json' \
+  -d '{"resource":"acct-1","scopes":["accounts:read"],"ttl_seconds":3600}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["consent_id"])')
+curl -s -X POST localhost:8090/admin/tenants/acme/consents/$CID/authorise -H "$A" >/dev/null
+# 2) 申请变更（待生效，旧作用域仍可用），再批准（新作用域生效、旧版本入版本链）
+AID=$(curl -s -X POST localhost:8090/admin/tenants/acme/consents/$CID/amendments -H "$A" -H 'Content-Type: application/json' \
+  -d '{"add_scopes":["payments:write"],"extend_seconds":3600}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["amendment_id"])')
+curl -s -X POST localhost:8090/admin/tenants/acme/amendments/$AID/approve -H "$A" | python3 -m json.tool
+# 3) 批量 + 幂等（同 request_id 连打两次，第二次 replayed=true，用量只增 1）
+curl -s -X POST localhost:8090/t/acme/consents/batch -H 'X-Tenant-Id: acme' -H "X-API-Key: $K" \
+  -H 'Content-Type: application/json' -d '{"request_id":"demo-1","actions":[{"action":"revoke","consent_id":"'"$CID"'"}]}'
+# 4) 自助查询：近期访问结论 + 关联回调（换别的租户查同 CID 得到 404 consent_not_found）
+curl -s localhost:8090/t/acme/consents/$CID/insight -H 'X-Tenant-Id: acme' -H "X-API-Key: $K" | python3 -m json.tool
 ```
 
 测试与服务日志（logger `obg.access` / `test.*`）会打印关键输入与判定依据，例如：
@@ -183,6 +294,9 @@ uv run python -m unittest discover -s tests -v
 凭证判定输入 tenant_path=t2 headers={...} => code=credential_unknown
 80 并发抢 20 名额: granted=20 rejected=60
 16 并发触发同一事件: attempts=1 status=delivered sender_calls=1
+16 并发同批：唯一执行 1 次，15 次拿到稳定重放结果
+20 轮批准/撤销撞车：先批准后撤销=N 先撤销后拒批=M
+跨进程并发同 request_id 结果=[{...replayed: true}, {...replayed: false}]
 ```
 
 测试文件覆盖：
@@ -196,5 +310,9 @@ uv run python -m unittest discover -s tests -v
 | `tests/test_05_callbacks.py` | 幂等触发、退避重试、最终失败可查询、事件隔离 |
 | `tests/test_06_audit_limits.py` | 脱敏、审计失败防半更新、载荷上限、超时与资源清理 |
 | `tests/test_07_concurrency_idempotency.py` | 并发回调幂等、并发同意授权、uvicorn 本地 HTTP 回环投递 |
+| `tests/test_09_consent_amendments.py` | 变更待生效不误伤、批准原子生效+版本链、撞撤销/到期作废、非法申请 |
+| `tests/test_10_batch_idempotency.py` | 批量部分失败无残留、重放一致不扣额度/不重发回调、并发同批一次、租户作用域 |
+| `tests/test_11_consent_insights.py` | 放行/拒绝原因视图、关联回调、跨租户 404、纯只读不碰用量与审计 |
+| `tests/test_12_amendment_races.py` | 并发批准单次生效、批准/撤销撞车 20 轮可解释、跨进程 request_id 幂等 |
 
 更多设计细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。

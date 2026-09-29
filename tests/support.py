@@ -62,7 +62,8 @@ class GatewayTestCase(unittest.TestCase):
         return tenant_id
 
     def issue_key(self, tenant_id: str = "t1", scopes=None, ttl=None):
-        scopes = scopes or ["accounts:read", "callbacks:write", "usage:read"]
+        scopes = scopes or ["accounts:read", "callbacks:write", "usage:read",
+                            "consents:write", "consents:read"]
         body: dict = {"scopes": scopes}
         if ttl is not None:
             body["ttl_seconds"] = ttl
