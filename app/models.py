@@ -23,6 +23,21 @@ class CallbackStatus(enum.Enum):
     FAILED = "failed"
 
 
+class AmendmentStatus(enum.Enum):
+    """同意变更申请的生命周期。
+
+    PENDING  待生效（审批前）：原作用域/有效期照常可用；
+    APPROVED 已批准：新作用域/有效期已正式生效；
+    REJECTED 已拒绝（审批方显式驳回）；
+    VOIDED   已作废：待生效期间同意被撤销或到期，按最终状态算，变更随之作废。
+    """
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    VOIDED = "voided"
+
+
 @dataclass
 class ApiKey:
     key_id: str
@@ -65,6 +80,7 @@ class Consent:
     expires_at: float | None
     revoked_at: float | None
     history: list[dict] = field(default_factory=list)
+    amendments: list[dict] = field(default_factory=list)
 
 
 _ALLOWED_CONSENT_TRANSITIONS: dict[ConsentStatus, set[ConsentStatus]] = {

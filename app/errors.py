@@ -143,3 +143,51 @@ class ConsentNotAuthorisedError(ConsentAccessError):
 
 class CallbackPayloadTooLargeError(PayloadTooLargeError):
     code = "callback_payload_too_large"
+
+
+class ConsentAmendmentError(GatewayError):
+    """同意变更相关错误的基类。"""
+
+    code = "consent_amendment_error"
+    status_code = 409
+
+
+class ConsentAmendmentNotFoundError(NotFoundError):
+    code = "consent_amendment_not_found"
+
+
+class ConsentAmendmentPendingError(ConsentAmendmentError):
+    """已有待生效变更，不允许重复提交。"""
+
+    code = "consent_amendment_pending"
+
+
+class ConsentAmendmentNotPendingError(ConsentAmendmentError):
+    """变更已不在待生效状态（已批准/已拒绝/已作废）。"""
+
+    code = "consent_amendment_not_pending"
+
+
+class ConsentAmendmentNoChangeError(ValidationError):
+    """变更请求既未追加作用域也未延长有效期。"""
+
+    code = "consent_amendment_no_change"
+
+
+class ConsentAmendmentInvalidStateError(ConsentAmendmentError):
+    """同意当前状态不允许申请变更（未授权/已撤销/已到期）。"""
+
+    code = "consent_amendment_invalid_state"
+
+
+class IdempotencyReplayMismatchError(GatewayError):
+    """同一幂等键重复提交但请求体与首次不一致。"""
+
+    code = "idempotency_replay_mismatch"
+    status_code = 409
+
+
+class BatchRequestError(ValidationError):
+    """批量请求整体不合法（空批次、动作未知等），整批未执行。"""
+
+    code = "batch_request_invalid"

@@ -15,6 +15,7 @@ import time
 import httpx
 
 from .audit import AuditLog
+from .batch import BatchService
 from .callbacks import CallbackDispatcher
 from .config import Settings
 from .consents import ConsentService
@@ -22,6 +23,7 @@ from .ratelimit import LimitConfig, RateLimiter
 from .storage import LocalStore
 from .tenants import TenantRegistry
 from .resources import MockBankService
+from .views import ConsentViewService
 
 log = logging.getLogger("obg.runtime")
 
@@ -111,6 +113,8 @@ class Gateway:
         self.audit = AuditLog(self.store, clock=clock)
         self.registry = TenantRegistry(self.store, self.audit, clock=clock)
         self.consents = ConsentService(self.store, self.audit, clock=clock)
+        self.batch = BatchService(self.store, self.consents, self.audit, clock=clock)
+        self.views = ConsentViewService(self.store, self.consents, clock=clock)
         self.limiter = RateLimiter(self.store, clock=clock)
         self.sender = LocalWebhookSender(self.store, timeout=settings.upstream_timeout_seconds)
         self.callbacks = CallbackDispatcher(

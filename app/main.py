@@ -54,6 +54,25 @@ class CreateConsentIn(BaseModel):
     ttl_seconds: float | None = None
 
 
+class RequestAmendmentIn(BaseModel):
+    add_scopes: list[str] = Field(default_factory=list)
+    extend_ttl_seconds: float = 0.0
+
+
+class BatchActionIn(BaseModel):
+    action: str
+    consent_id: str | None = None
+    resource: str | None = None
+    scopes: list[str] | None = None
+    ttl_seconds: float | None = None
+    add_scopes: list[str] | None = None
+    extend_ttl_seconds: float | None = None
+
+
+class BatchConsentsIn(BaseModel):
+    actions: list[BatchActionIn] = Field(min_length=1)
+
+
 class MintTokenIn(BaseModel):
     scopes: list[str]
     ttl_seconds: float = 3600.0
@@ -259,6 +278,27 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
         return gw.consents.get(tenant_id, consent_id)
 
     @application.post(
+        "/admin/tenants/{tenant_id}/consents/{consent_id}/amendments/{amendment_id}/approve",
+        dependencies=[Depends(require_admin)],
+    )
+    def admin_approve_amendment(tenant_id: str, consent_id: str, amendment_id: str):
+        out = gw.consents.approve_amendment(tenant_id, consent_id, amendment_id)
+        gw.callbacks.trigger(
+            f"evt-consent-{consent_id}", tenant_id, "consent.amended",
+            {"consent_id": consent_id, "amendment_id": amendment_id,
+             "scopes": out["consent"]["scopes"],
+             "expires_at": out["consent"]["expires_at"]},
+        )
+        return out
+
+    @application.post(
+        "/admin/tenants/{tenant_id}/consents/{consent_id}/amendments/{amendment_id}/reject",
+        dependencies=[Depends(require_admin)],
+    )
+    def admin_reject_amendment(tenant_id: str, consent_id: str, amendment_id: str):
+        return gw.consents.reject_amendment(tenant_id, consent_id, amendment_id)
+
+    @application.post(
         "/admin/tenants/{tenant_id}/expire-consents", dependencies=[Depends(require_admin)]
     )
     def admin_expire(tenant_id: str):
@@ -368,6 +408,130 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
     ):
         _authenticate("usage:read", x_tenant_id, x_api_key, authorization)
         return gw.limiter.usage(tenant_id, endpoint, gw.default_limits())
+
+    # ------------------------------------------------ 同意变更（合作方自助）
+
+    @application.post("/t/{tenant_id}/consents/{consent_id}/amendments")
+    def request_amendment(
+        tenant_id: str,
+        consent_id: str,
+        body: RequestAmendmentIn,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        principal = _authenticate("consents:write", x_tenant_id, x_api_key, authorization)
+        if principal.tenant_id != tenant_id:
+            raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
+        endpoint = "POST /consents/{id}/amendments"
+
+        def _do():
+            return gw.consents.request_amendment(
+                tenant_id, consent_id,
+                add_scopes=body.add_scopes,
+                extend_ttl_seconds=body.extend_ttl_seconds,
+            )
+
+        return _guarded(tenant_id, endpoint, _do)
+
+    # ------------------------------------------- 同意动作批量（请求级幂等）
+
+    @application.post("/t/{tenant_id}/consent-actions/batch")
+    def batch_consents(
+        tenant_id: str,
+        body: BatchConsentsIn,
+        idempotency_key: str | None = Header(default=None),
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        """一次提交多条同意动作；同 Idempotency-Key 重放只返回首次稳定结果。"""
+        principal = _authenticate("consents:write", x_tenant_id, x_api_key, authorization)
+        if principal.tenant_id != tenant_id:
+            raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
+        endpoint = "POST /consent-actions/batch"
+        # 先做整批形态校验（空批次/未知动作）：整批非法时不占额度
+        actions = gw.batch.validate_actions(
+            [a.model_dump(exclude_none=True) for a in body.actions]
+        )
+        from .batch import _fingerprint
+
+        # 重放在占额度之前短路：同键等价请求直接返回首次稳定结果，
+        # 不重复扣额度、不重复执行、不重复发回调。
+        replay = gw.batch.lookup_replay(
+            tenant_id, idempotency_key, _fingerprint(actions)
+        )
+        if replay is not None:
+            return replay
+
+        def _fire_batch_callbacks(events):
+            for ev in events:
+                cid = ev["consent_id"]
+                if ev["kind"] == "authorise":
+                    gw.callbacks.trigger(
+                        f"evt-consent-{cid}", tenant_id, "consent.authorised",
+                        {"consent_id": cid, "resource": ev.get("resource")},
+                    )
+                elif ev["kind"] == "revoke":
+                    gw.callbacks.trigger(
+                        f"evt-consent-{cid}", tenant_id, "consent.revoked",
+                        {"consent_id": cid},
+                    )
+
+        def _do():
+            return gw.batch.execute(
+                tenant_id, idempotency_key, actions,
+                on_committed=_fire_batch_callbacks,
+            )
+
+        return _guarded(tenant_id, endpoint, _do)
+
+    # --------------------------------------------- 同意自助只读视图（本租户）
+
+    def _view_auth(
+        tenant_id: str, x_tenant_id, x_api_key, authorization, required_scope="consents:read"
+    ):
+        principal = _authenticate(required_scope, x_tenant_id, x_api_key, authorization)
+        if principal.tenant_id != tenant_id:
+            raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
+        return principal
+
+    @application.get("/t/{tenant_id}/consents/{consent_id}/view")
+    def consent_overview(
+        tenant_id: str,
+        consent_id: str,
+        limit: int = 50,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        _view_auth(tenant_id, x_tenant_id, x_api_key, authorization)
+        # 纯只读：不经限流守卫、不写审计，不影响业务用量口径
+        return gw.views.overview(tenant_id, consent_id, limit=limit)
+
+    @application.get("/t/{tenant_id}/consents/{consent_id}/access-results")
+    def consent_access_results(
+        tenant_id: str,
+        consent_id: str,
+        limit: int = 50,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        _view_auth(tenant_id, x_tenant_id, x_api_key, authorization)
+        return gw.views.access_results(tenant_id, consent_id, limit=limit)
+
+    @application.get("/t/{tenant_id}/consents/{consent_id}/callbacks")
+    def consent_callback_deliveries(
+        tenant_id: str,
+        consent_id: str,
+        limit: int = 50,
+        x_tenant_id: str | None = Header(default=None),
+        x_api_key: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ):
+        _view_auth(tenant_id, x_tenant_id, x_api_key, authorization)
+        return gw.views.callback_deliveries(tenant_id, consent_id, limit=limit)
 
     return application
 

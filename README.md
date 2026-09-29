@@ -118,6 +118,103 @@ PENDING ──authorise──▶ AUTHORISED ──revoke──▶ REVOKED   (终
 | 同意不含所需 scope | `consent_scope_missing` |
 | 同意不属于该租户 | `consent_not_found`（不泄漏存在性） |
 
+### 3.1 同意变更（追加作用域 / 延长有效期）
+
+已授权（`AUTHORISED`）的同意可以申请变更，变更有独立的生命周期，
+**审批通过前在跑的业务不受任何影响**：
+
+```
+AUTHORISED ──request_amendment──▶ 变更 PENDING（待生效）
+                                   │  原 scopes / expires_at 照常有效
+                          ┌────────┼────────────────┐
+                     approve     reject        同意被 revoke/expire
+                          ▼         ▼                ▼
+                     APPROVED   REJECTED          VOIDED（随终态作废）
+```
+
+- 申请（合作方自助，需 `consents:write`）：
+
+  ```bash
+  POST /t/{tid}/consents/{cid}/amendments
+  {"add_scopes":["payments:write"], "extend_ttl_seconds":600}
+  ```
+
+  两者至少给一个有效变更：`add_scopes` 非空，或 `extend_ttl_seconds > 0`；
+  否则 `consent_amendment_no_change` / 400。同一同意同时只允许一个待生效变更，
+  重复提交返回 `consent_amendment_pending` / 409。
+- **待生效期间**：同意的 `scopes`、`expires_at` 完全不变，原授权访问照常放行，
+  绝不误伤正在跑的业务。
+- 审批（管理面）：
+
+  ```bash
+  POST /admin/tenants/{tid}/consents/{cid}/amendments/{aid}/approve
+  POST /admin/tenants/{tid}/consents/{cid}/amendments/{aid}/reject
+  ```
+
+  批准后新作用域（原作用域 ∪ 追加作用域，去重保序）与延长后的有效期
+  （从当前 `expires_at` 顺延）才**正式生效**，并触发 `consent.amended` 回调；
+  驳回则原授权分毫不动。
+- **变更与撤销/到期相撞**：待生效期间同意一旦被撤销或到期，变更在**同一事务**
+  内被置为 `voided`（history/审计带 `reason=consent_revoked|consent_expired`），
+  按同意最终状态算；此后再点批准得到 `consent_amendment_not_pending`，
+  新作用域从未写入、绝不可能在撤销/到期后放行任何读写。
+- **只增不改可追溯**：每次申请/批准/驳回/作废都让同意 `version += 1` 并向
+  `history` 追加事件；变更记录 `amendments[]`（含 `before/after` 快照与
+  `decide_history`）与生效版本快照 `revisions[]` 全程保留，旧版本不被覆盖或删除。
+
+错误码：`consent_amendment_invalid_state`（对非 AUTHORISED 同意申请）、
+`consent_amendment_pending`、`consent_amendment_not_pending`、
+`consent_amendment_no_change`、`consent_amendment_not_found`。
+
+### 3.2 同意动作批量提交与请求级幂等
+
+```bash
+POST /t/{tid}/consent-actions/batch
+Header: Idempotency-Key: <合作方自己生成的唯一请求标识>
+{
+  "actions": [
+    {"action":"create","resource":"acct-1","scopes":["accounts:read"],"ttl_seconds":3600},
+    {"action":"authorise","consent_id":"consent-..."},
+    {"action":"request_amendment","consent_id":"consent-...","add_scopes":["payments:write"],"extend_ttl_seconds":600},
+    {"action":"revoke","consent_id":"consent-..."}
+  ]
+}
+```
+
+- 支持的 `action`：`create` / `authorise` / `revoke` / `request_amendment`，
+  可任意混合、按数组顺序执行。需 `consents:write`。
+- **逐条结果**：返回 `results[]`，每条带 `index/action/ok`，失败条带
+  `error.code`（例如对已撤销同意变更 → `consent_amendment_invalid_state`，
+  操作不存在的同意 → `consent_not_found`）。单条失败不连累其它条目。
+- **整批原子**：所有条目状态变更、审计与幂等记录在同一个跨集合事务中提交，
+  要么全部判定结果一起落盘，要么整体不落盘——不会出现改了一半/算了一半；
+  提交阶段磁盘故障时三个集合都零残留，同键随后可原样重试成功。
+- **请求级幂等**：同一 `(租户, Idempotency-Key)` 只生效一次。重复提交
+  （含并发）直接返回首次的稳定结果（`replayed=true`），不重复改状态、
+  **不重复扣限流配额**（重放在占用配额前短路）、不重复触发回调
+  （回调事件 id 确定性派生 + 回调自身 `event_id` 幂等，双重保证）。
+  同一键但请求体不同返回 `idempotency_replay_mismatch` / 409；
+  数值 `10` 与 `10.0` 等语义等价写法视为同一请求。幂等键按租户隔离。
+- 整批形态非法（空批次、未知动作）返回 `batch_request_invalid` / 400，整批不执行；
+  缺少 `Idempotency-Key` 返回 `validation_error` / 400。
+- 适用范围：批量覆盖合作方可自助执行的四类动作；变更的**审批/驳回**属于管理面
+  决定，不在批量接口内（仍走 3.1 的管理面端点）。
+
+### 3.3 合作方自助只读视图
+
+合作方可按自己名下的同意查看近期访问结果与关联回调（需 `consents:read`），
+**纯只读、不经限流计数、不产生业务审计，不影响正常业务用量口径**：
+
+| 接口 | 内容 |
+|---|---|
+| `GET /t/{tid}/consents/{cid}/view` | 同意当前状态 + 近期访问结果 + 关联回调汇总 |
+| `GET /t/{tid}/consents/{cid}/access-results?limit=50` | 近期闸门结果：放行 `allowed` 与各类拒绝原因（`consent_revoked/consent_expired/consent_scope_missing/...`） |
+| `GET /t/{tid}/consents/{cid}/callbacks?limit=50` | 关联回调投递：状态、尝试次数、每次尝试日志、`last_error`、下次重试时间 |
+
+- 严格租户隔离：只能查本租户名下同意；访问他人同意一律返回
+  `consent_not_found` / 404，与不存在完全同形，不泄漏存在性。
+- `limit` 默认 50、上限 200，结果按时间升序返回最近 N 条。
+
 ## 4. 限流与配额规则
 
 按 **租户 + 接口** 两级滑动窗口计数：
@@ -169,8 +266,11 @@ PENDING ──authorise──▶ AUTHORISED ──revoke──▶ REVOKED   (终
 ## 8. 本地验证方法
 
 ```bash
-# 全部单测（27 个）：异常链路 + 并发竞争 + 真实本地 HTTP 回环
+# 全部单测（61 个）：异常链路 + 并发竞争 + 变更/批量/自助视图 + 真实本地 HTTP 回环
 uv run python -m unittest discover -s tests -v
+
+# 只跑本次新增能力
+uv run python -m unittest tests.test_09_amendments tests.test_10_batch_views -v
 
 # 交互式演示
 ./scripts/demo.sh 8090
@@ -196,5 +296,7 @@ uv run python -m unittest discover -s tests -v
 | `tests/test_05_callbacks.py` | 幂等触发、退避重试、最终失败可查询、事件隔离 |
 | `tests/test_06_audit_limits.py` | 脱敏、审计失败防半更新、载荷上限、超时与资源清理 |
 | `tests/test_07_concurrency_idempotency.py` | 并发回调幂等、并发同意授权、uvicorn 本地 HTTP 回环投递 |
+| `tests/test_09_amendments.py` | 变更待生效不打断业务、批准生效、驳回保留原授权、撤销/到期撞变更作废且新作用域绝不放行、只增不改可追溯 |
+| `tests/test_10_batch_views.py` | 批量混合/部分失败不留残留、重放稳定不重复扣额度发回调、同键异码 409、并发同一批/同一变更只执行一次、自助视图严格不跨租户且只读 |
 
 更多设计细节见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。

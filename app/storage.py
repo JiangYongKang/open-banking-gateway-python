@@ -186,12 +186,13 @@ class LocalStore:
                 by_name = {
                     n: _CollectionProxy(n, s) for n, s in zip(names_sorted, snapshots)
                 }
-                # 按调用方声明的名字顺序传参（重复名字保留，映射到同一代理）
+                # 加锁按名字排序（避免死锁），传参严格按调用方声明的名字顺序，
+                # 与 fn 的位置参数一一对应（重复名字映射到同一代理）
                 result = fn(*(by_name[n] for n in names))
                 # 两阶段提交：先把所有集合序列化为临时文件（序列化/磁盘失败
                 # 发生在正式文件被替换之前），全部成功后再依次原子 rename。
                 stages: list[tuple[Collection, str]] = []
-                for name in dict.fromkeys(names):
+                for name in names_sorted:
                     coll = self.collection(name)
                     tmp_path = coll._stage_temp(by_name[name].snapshot())
                     stages.append((coll, tmp_path))
