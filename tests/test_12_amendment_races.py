@@ -3,7 +3,8 @@
 * 同一变更单并发批准：版本只推进一次、旧版本链只有一条；
 * 批准与撤销并发撞车：要么“已批准后撤销”要么“撤销后批准被拒”，结果明确可解释，
   绝不出现撤销后新作用域仍可用；
-* 跨进程（multiprocessing）同一 request_id 并发批量提交：只执行一次。
+* 跨进程（multiprocessing）同一 request_id 并发批量提交：只执行一次，
+  落败进程等待后拿到与首次完全一致的结果（不返回处理中/冲突）。
 """
 from __future__ import annotations
 
@@ -184,8 +185,10 @@ class CrossProcessIdempotencyTest(unittest.TestCase):
         assert len(ids) == 1, outs
         fresh = [o for o in outs if o.get("replayed") is False]
         assert len(fresh) == 1, outs
-        # 另一个要么重放，要么 in_progress；绝不允许第二次创建同意
-        assert all(o.get("code") in (None, "idempotency_in_progress") for o in outs)
+        # 新承诺：落败进程等待首个完成后拿到同一份首次结果，不再收到
+        # idempotency_in_progress；两个进程都必须成功。
+        assert all("error" not in o for o in outs), outs
+        assert {o.get("replayed") for o in outs} == {True, False}, outs
 
 
 if __name__ == "__main__":

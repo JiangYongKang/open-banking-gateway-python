@@ -106,6 +106,59 @@ class CallbackDispatcher:
         self._attempt_one(event_id, sleep_before=False)
         return self.status(event_id)
 
+    def queue_in_tx(
+        self,
+        event_id: str,
+        tenant_id: str,
+        event_type: str,
+        payload: dict,
+        callbacks_proxy,
+        audit_proxy=None,
+    ) -> tuple[dict, bool]:
+        """在调用方的事务代理内幂等登记回调事件，**不**实际投递。
+
+        用于批量提交的 outbox：事件与业务状态在同一个大事务里落定（事务提交前
+        一条回调都不发，事务失败则事件与业务一起回滚）。返回
+        ``(record, created)``，``created=False`` 表示该 event_id 此前已存在，
+        调用方不应再为其触发首次投递（其投递生命周期已经存在）。
+        """
+        import json
+
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self._max_payload_bytes:
+            raise CallbackPayloadTooLargeError(
+                f"回调载荷超过 {self._max_payload_bytes} 字节", tenant_id=tenant_id
+            )
+        existing = callbacks_proxy.get(event_id)
+        if existing is not None:
+            return existing, False
+        now = self._clock()
+        record = {
+            "event_id": event_id,
+            "tenant_id": tenant_id,
+            "event_type": event_type,
+            "payload": payload,
+            "status": "pending",
+            "attempts": 0,
+            "max_attempts": self._max_attempts,
+            "created_at": now,
+            "updated_at": now,
+            "next_attempt_at": now,
+            "delivered_at": None,
+            "last_error": None,
+            "attempt_log": [],
+        }
+        callbacks_proxy.put(event_id, record)
+        if self._audit is not None and audit_proxy is not None:
+            eid, entry = make_entry(
+                "callback_trigger",
+                tenant_id=tenant_id,
+                result="state_change",
+                detail={"event_id": event_id, "event_type": event_type},
+                clock=self._clock,
+            )
+            audit_proxy.put(eid, entry)
+        return record, True
+
     def _attempt_one(self, event_id: str, *, sleep_before: bool) -> dict | None:
         """对单个事件执行一次投递尝试并原子更新记录；不满足条件则跳过返回快照。"""
         # 1) 锁内做最后一次可投递判定（状态/到点时间/已尝试次数），取出快照

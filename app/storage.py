@@ -142,6 +142,14 @@ class _CollectionProxy:
     def snapshot(self) -> dict[str, Any]:
         return self._data
 
+    def reset(self, snapshot: dict[str, Any]) -> None:
+        """把代理整体复位到给定快照（调用方负责传入深拷贝）。
+
+        用于一个大事务内部“逐项尝试、单项失败只回滚该项”的场景：
+        尝试前保存各集合快照，失败时复位，使该项的改动不落到最终落盘的快照。
+        """
+        self._data = snapshot
+
 
 class LocalStore:
     """本地 JSON 文件存储，每个名字对应一个 Collection。"""

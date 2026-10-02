@@ -28,6 +28,7 @@ from .errors import (
     RateLimitError,
     ValidationError,
 )
+from .batch import BatchSlot
 from .security import Principal, build_security_deps
 from .tokens import issue_token
 
@@ -428,15 +429,14 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
             raise AuthError("认证租户与路径租户不一致", tenant_id=tenant_id)
         endpoint = "POST /consents/batch"
         actions = [a.model_dump(exclude_none=True) for a in body.actions]
-        fingerprint = gw.batch.fingerprint(actions)
-        # 幂等重放直接返回首次结果：不进限流守卫，不重复扣额度/发回调/改状态
-        replay = gw.batch.replay_result(tenant_id, body.request_id, fingerprint)
-        if replay is not None:
-            return replay
-        return _guarded(
-            tenant_id, endpoint,
-            lambda: gw.batch.submit(tenant_id, body.request_id, actions),
-        )
+        # prepare 在 per-key 键锁内判定：已完成 -> 直接稳定重放（不进限流、
+        # 不扣额度、不发回调、不改状态）；并发窗口内的落败方会等首个完成后
+        # 拿到同一份首次结果，同样不进限流；只有拿到执行槽的唯一执行者才
+        # 占 1 次整批量并真正执行（整批一个事务，失败可安全重试）。
+        prepared = gw.batch.prepare(tenant_id, body.request_id, actions)
+        if not isinstance(prepared, BatchSlot):
+            return prepared
+        return _guarded(tenant_id, endpoint, prepared.execute)
 
     @application.get("/t/{tenant_id}/consents/{consent_id}/insight")
     def consent_insight(

@@ -35,12 +35,23 @@ app/
    进入 REVOKED/EXPIRED 时，终态化事务会同时把其 pending 变更单置 `void`
    （`consents.py` 通过 `amendment_void_hook` 调用 `amendments.void_pending_in_tx`），
    因此“先撤销/到期、后批准”在同一事务里就被否决，新作用域在终态后永不可用。
-4. **批量逐项原子 + 请求级幂等**：每个动作独立事务执行并被 try 隔离，单项失败只回滚该项、
-   不外溢、不留半成品。幂等以「租户 | request_id」为键存入 `idempotency` 集合，分三阶段：
-   独立事务 `claim`（processing 占位）→ 锁外逐项执行 → 独立事务写 `completed` 结果与审计。
-   同 request_id 进程内用每键锁串行，跨进程靠存储中的 processing 标记互斥；
-   指纹（动作列表规范化 JSON 的 SHA-256）不一致返回 `idempotency_conflict`。
-   HTTP 层在限流守卫**之前**先查重，使幂等重放不扣额度、不发回调、不改状态。
+4. **批量整批原子（all-or-nothing）+ 请求级幂等**：幂等以「租户 | request_id」
+   为键存入 `idempotency` 集合。执行分两个阶段：`prepare` 在 per-key 键锁
+   （存储目录 `batch-locks/<sha256(键)>.lock` 上的 flock，独立 fd 同时串行化
+   多线程与多进程）内查重并把记录置为 `processing`；`execute` 把**整批所有动作
+   连同 outbox 回调登记、审计、幂等 completed 记录放进同一个跨集合事务**一次落盘
+   （idempotency + consents + amendments + callbacks + audit）。两阶段提交保证
+   任一盘写失败时所有正式文件都不被替换，因此不存在“同意已建/回调已发、批次却
+   没落定”的半状态。单项业务失败在事务内通过代理快照深拷贝复位，只回滚该项，
+   其它成功项照常随批落定。事务提交成功后才对本次新登记的回调事件做首次投递
+   （outbox：投递失败走回调服务既有的退避重试，不影响批次结果）。并发同
+   request_id 时落败方持锁等待首个完成，随后直接读到首次结果，**不会**收到
+   processing/冲突中间态；指纹（动作列表规范化 JSON 的 SHA-256）不一致返回
+   `idempotency_conflict`。若执行者崩溃（进程退出时 flock 由内核释放）或最终
+   落盘失败，记录会停在 `processing`，下一个拿到键锁的同标识重试者**接管执行**
+   （stale claim takeover），结果最终恰好落定一次。HTTP 层只有拿到执行槽的唯一
+   执行者进入限流守卫；重放与并发落败方都在守卫之前短路，因此整批只计 1 次配额，
+   重放（含并发窗口里的落败方）0 占用、0 回调、0 状态变更。
 5. **自助视图纯只读**：`insights.py` 只调用 `Collection.list_items()` 快照读并按 tenant_id
    过滤，跨租户与不存在统一抛 `consent_not_found`；不写审计、不过限流，故不污染用量口径。
 6. **限流原子性**：判定与计数在同一次文件锁事务内；超限分支在追加时间戳之前抛出，
@@ -58,5 +69,7 @@ app/
 | `idempotency` | `<tenant>\|<request_id>` | 批量幂等记录：指纹、processing/completed、首次完整逐项结果与摘要 |
 
 `consents` 记录新增 `versions`（旧版本完整快照链）。所有新集合沿用同一套 flock +
-两阶段事务，崩溃时靠 processing 标记防止跨进程重复执行（极端情况会得到
-`idempotency_in_progress` 而不是重复生效）。
+两阶段事务。批量执行崩溃后，`processing` 记录不是永久闸门：flock 随进程退出自动
+释放，后续同 request_id 重试拿到键锁后会接管执行并落定首次稳定结果，调用方不会
+再收到 `idempotency_in_progress`（该错误码保留给潜在的外部扩展场景，标准流程不再
+产生）。
