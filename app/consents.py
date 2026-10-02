@@ -41,88 +41,17 @@ class ConsentService:
         # 由 runtime 注入：同意进入终态时在同事务内作废待生效变更
         self.amendment_void_hook = None
 
-    # ---- 内部：事务内流转 ------------------------------------------------
+    # ---- 事务内原语：操作的是事务代理快照，落盘由外层 store.atomic 统一完成
+    #
+    # 公开 API（create/authorise/revoke）各自包一个小事务调用这些原语；
+    # 批量提交则把多个原语放进同一个大事务，保证整批原子提交。
 
-    def _transition(self, tenant_id: str, consent_id: str, target: ConsentStatus, action: str) -> dict:
-        now = self._clock()
-        coll_names = ["consents", "audit"]
-        if self.amendment_void_hook is not None and target in (
-            ConsentStatus.REVOKED, ConsentStatus.EXPIRED
-        ):
-            coll_names.append("amendments")
-
-        def _tx(consents, audit, amendments=None):
-            rec = consents.get(consent_id)
-            if rec is None or rec["tenant_id"] != tenant_id:
-                # 注意：先校验归属，不泄漏其它租户同意是否存在
-                raise ConsentNotFoundError(f"同意 {consent_id!r} 不存在", tenant_id=tenant_id)
-            current = ConsentStatus(rec["status"])
-            if not can_transition(current, target):
-                if self._audit is not None:
-                    eid, entry = make_entry(
-                        action,
-                        tenant_id=tenant_id,
-                        result="denied",
-                        detail={"consent_id": consent_id, "from": current.value, "to": target.value,
-                                "reason": "invalid_transition"},
-                        clock=self._clock,
-                    )
-                    audit.put(eid, entry)
-                raise ConsentStateError(
-                    f"非法状态流转: {current.value} -> {target.value}", tenant_id=tenant_id
-                )
-            event = {"ts": now, "from": current.value, "to": target.value, "action": action}
-            rec["status"] = target.value
-            rec["version"] += 1
-            rec["history"].append(event)
-            if target is ConsentStatus.AUTHORISED:
-                rec["authorised_at"] = now
-                rec["expires_at"] = now + rec["ttl_seconds"]
-            elif target is ConsentStatus.REVOKED:
-                rec["revoked_at"] = now
-            elif target is ConsentStatus.EXPIRED:
-                rec["expires_at"] = now
-            # 变更待生效期间同意终态化：同一事务内把待生效变更作废，
-            # 保证“先撤销/到期，后批准”绝不可能让新作用域生效。
-            voided: list[str] = []
-            if amendments is not None and self.amendment_void_hook is not None:
-                reason = "consent_revoked" if target is ConsentStatus.REVOKED else "consent_expired"
-                voided = self.amendment_void_hook(
-                    consents, amendments, audit, consent_id, reason, now
-                )
-            consents.put(consent_id, rec)
-            if self._audit is not None:
-                eid, entry = make_entry(
-                    action,
-                    tenant_id=tenant_id,
-                    result="state_change",
-                    detail={"consent_id": consent_id, "from": current.value, "to": target.value,
-                            "version": rec["version"], "amendments_voided": voided},
-                    clock=self._clock,
-                )
-                audit.put(eid, entry)
-            return rec
-
-        return self._store.atomic(coll_names, _tx)
-
-    # ---- 公开 API --------------------------------------------------------
-
-    def create(
-        self,
-        tenant_id: str,
-        resource: str,
-        scopes: list[str],
-        ttl_seconds: float,
+    def _build_create_record(
+        self, tenant_id: str, resource: str, scopes: list[str],
+        ttl_seconds: float, now: float,
     ) -> dict:
-        if not resource or not isinstance(resource, str):
-            raise ValidationError("resource 不能为空", tenant_id=tenant_id)
-        if not scopes:
-            raise ValidationError("scopes 至少包含一个作用域", tenant_id=tenant_id)
-        if ttl_seconds is None or ttl_seconds <= 0:
-            raise ValidationError("ttl_seconds 必须为正数", tenant_id=tenant_id)
-        now = self._clock()
         consent_id = _new_consent_id()
-        record = {
+        return {
             "consent_id": consent_id,
             "tenant_id": tenant_id,
             "resource": resource,
@@ -139,20 +68,130 @@ class ConsentService:
                          "action": "create"}],
         }
 
-        def _tx(consents, audit):
-            consents.put(consent_id, record)
-            if self._audit is not None:
+    def create_in_tx(
+        self,
+        consents_proxy,
+        audit_proxy,
+        tenant_id: str,
+        resource: str,
+        scopes: list[str],
+        ttl_seconds: float,
+        *,
+        now: float | None = None,
+    ) -> dict:
+        """在调用方事务内创建同意（参数校验 + 记录构造 + 写代理快照）。"""
+        if not resource or not isinstance(resource, str):
+            raise ValidationError("resource 不能为空", tenant_id=tenant_id)
+        if not scopes:
+            raise ValidationError("scopes 至少包含一个作用域", tenant_id=tenant_id)
+        if ttl_seconds is None or ttl_seconds <= 0:
+            raise ValidationError("ttl_seconds 必须为正数", tenant_id=tenant_id)
+        record = self._build_create_record(
+            tenant_id, resource, scopes, float(ttl_seconds),
+            self._clock() if now is None else now,
+        )
+        return self._create_in_tx(consents_proxy, audit_proxy, record)
+
+    def _create_in_tx(self, consents_proxy, audit_proxy, record: dict) -> dict:
+        consents_proxy.put(record["consent_id"], record)
+        if self._audit is not None and audit_proxy is not None:
+            eid, entry = make_entry(
+                "consent_create",
+                tenant_id=record["tenant_id"],
+                result="state_change",
+                detail={"consent_id": record["consent_id"], "resource": record["resource"],
+                        "scopes": list(record["scopes"])},
+                clock=self._clock,
+            )
+            audit_proxy.put(eid, entry)
+        return record
+
+    def _transition_in_tx(self, consents_proxy, audit_proxy, amendments_proxy,
+                          tenant_id: str, consent_id: str,
+                          target: ConsentStatus, action: str, now: float) -> dict:
+        rec = consents_proxy.get(consent_id)
+        if rec is None or rec["tenant_id"] != tenant_id:
+            # 注意：先校验归属，不泄漏其它租户同意是否存在
+            raise ConsentNotFoundError(f"同意 {consent_id!r} 不存在", tenant_id=tenant_id)
+        current = ConsentStatus(rec["status"])
+        if not can_transition(current, target):
+            if self._audit is not None and audit_proxy is not None:
                 eid, entry = make_entry(
-                    "consent_create",
+                    action,
                     tenant_id=tenant_id,
-                    result="state_change",
-                    detail={"consent_id": consent_id, "resource": resource, "scopes": list(scopes)},
+                    result="denied",
+                    detail={"consent_id": consent_id, "from": current.value,
+                            "to": target.value, "reason": "invalid_transition"},
                     clock=self._clock,
                 )
-                audit.put(eid, entry)
+                audit_proxy.put(eid, entry)
+            raise ConsentStateError(
+                f"非法状态流转: {current.value} -> {target.value}", tenant_id=tenant_id
+            )
+        event = {"ts": now, "from": current.value, "to": target.value, "action": action}
+        rec["status"] = target.value
+        rec["version"] += 1
+        rec["history"].append(event)
+        if target is ConsentStatus.AUTHORISED:
+            rec["authorised_at"] = now
+            rec["expires_at"] = now + rec["ttl_seconds"]
+        elif target is ConsentStatus.REVOKED:
+            rec["revoked_at"] = now
+        elif target is ConsentStatus.EXPIRED:
+            rec["expires_at"] = now
+        # 变更待生效期间同意终态化：同一事务内把待生效变更作废，
+        # 保证“先撤销/到期，后批准”绝不可能让新作用域生效。
+        voided: list[str] = []
+        if amendments_proxy is not None and self.amendment_void_hook is not None:
+            reason = "consent_revoked" if target is ConsentStatus.REVOKED else "consent_expired"
+            voided = self.amendment_void_hook(
+                consents_proxy, amendments_proxy, audit_proxy, consent_id, reason, now
+            )
+        consents_proxy.put(consent_id, rec)
+        if self._audit is not None and audit_proxy is not None:
+            eid, entry = make_entry(
+                action,
+                tenant_id=tenant_id,
+                result="state_change",
+                detail={"consent_id": consent_id, "from": current.value, "to": target.value,
+                        "version": rec["version"], "amendments_voided": voided},
+                clock=self._clock,
+            )
+            audit_proxy.put(eid, entry)
+        return rec
 
-        self._store.atomic(["consents", "audit"], _tx)
-        return record
+    # ---- 内部：事务内流转 ------------------------------------------------
+
+    def _transition(self, tenant_id: str, consent_id: str, target: ConsentStatus, action: str) -> dict:
+        now = self._clock()
+        coll_names = ["consents", "audit"]
+        if self.amendment_void_hook is not None and target in (
+            ConsentStatus.REVOKED, ConsentStatus.EXPIRED
+        ):
+            coll_names.append("amendments")
+
+        def _tx(consents, audit, amendments=None):
+            return self._transition_in_tx(
+                consents, audit, amendments, tenant_id, consent_id, target, action, now
+            )
+
+        return self._store.atomic(coll_names, _tx)
+
+    # ---- 公开 API --------------------------------------------------------
+
+    def create(
+        self,
+        tenant_id: str,
+        resource: str,
+        scopes: list[str],
+        ttl_seconds: float,
+    ) -> dict:
+        def _tx(consents, audit):
+            return self.create_in_tx(
+                consents, audit, tenant_id, resource, scopes, ttl_seconds
+            )
+
+        return self._store.atomic(["consents", "audit"], _tx)
 
     def authorise(self, tenant_id: str, consent_id: str) -> dict:
         return self._transition(tenant_id, consent_id, ConsentStatus.AUTHORISED, "consent_authorise")

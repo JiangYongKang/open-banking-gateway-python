@@ -433,10 +433,16 @@ def create_app(settings: Settings | None = None, *, gateway=None) -> FastAPI:
         replay = gw.batch.replay_result(tenant_id, body.request_id, fingerprint)
         if replay is not None:
             return replay
-        return _guarded(
-            tenant_id, endpoint,
-            lambda: gw.batch.submit(tenant_id, body.request_id, actions),
-        )
+
+        # 并发窗口：上面的只读预判可能落空（首个请求尚在大事务内）。此处正常进守卫，
+        # 但 submit 返回后若发现拿到的其实是首次结果的重放（本线程是并发落败方），
+        # 归还限流占位——整批只有真正的首次执行占用 1 次，落败重放占 0 次。
+        with gw.guard(tenant_id, endpoint) as g:
+            result = gw.batch.submit(tenant_id, body.request_id, actions)
+            if result.get("replayed"):
+                return result
+            g.commit()
+            return result
 
     @application.get("/t/{tenant_id}/consents/{consent_id}/insight")
     def consent_insight(

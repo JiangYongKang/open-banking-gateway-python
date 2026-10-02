@@ -52,6 +52,62 @@ class CallbackDispatcher:
     def _backoff(self, failed_attempts: int) -> float:
         return self._base * (self._factor ** max(0, failed_attempts - 1))
 
+    # ---- 事务内 outbox 原语（供批量大事务调用）---------------------------
+
+    def plan_in_tx(self, callbacks_proxy, audit_proxy, event_id: str, tenant_id: str,
+                   event_type: str, payload: dict, *, now: float | None = None) -> dict:
+        """在调用方事务内登记一个 pending 回调（含触发审计），但不投递。
+
+        * 按 event_id 幂等：已存在（无论什么状态）则原样返回，不重复登记；
+        * 投递发生在外层事务提交之后（:meth:`deliver_pending`），
+          因此事务整体回滚时绝不会发出回调，而提交成功后回调绝不会丢；
+        * 返回 ``{"record": ..., "duplicate": bool}``，duplicate 为 True 时
+          调用方不应再安排投递。
+        """
+        import json
+
+        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self._max_payload_bytes:
+            raise CallbackPayloadTooLargeError(
+                f"回调载荷超过 {self._max_payload_bytes} 字节", tenant_id=tenant_id
+            )
+        existing = callbacks_proxy.get(event_id)
+        if existing is not None:
+            return {"record": existing, "duplicate": True}
+        ts = self._clock() if now is None else now
+        record = {
+            "event_id": event_id,
+            "tenant_id": tenant_id,
+            "event_type": event_type,
+            "payload": payload,
+            "status": "pending",
+            "attempts": 0,
+            "max_attempts": self._max_attempts,
+            "created_at": ts,
+            "updated_at": ts,
+            "next_attempt_at": ts,
+            "delivered_at": None,
+            "last_error": None,
+            "attempt_log": [],
+        }
+        callbacks_proxy.put(event_id, record)
+        if self._audit is not None and audit_proxy is not None:
+            eid, entry = make_entry(
+                "callback_trigger",
+                tenant_id=tenant_id,
+                result="state_change",
+                detail={"event_id": event_id, "event_type": event_type},
+                clock=self._clock,
+            )
+            audit_proxy.put(eid, entry)
+        return {"record": record, "duplicate": False}
+
+    def deliver_pending(self, event_ids) -> list[dict]:
+        """事务提交后调用：对新登记的事件做首次投递，已投递/已存在的自动跳过。"""
+        statuses = []
+        for event_id in dict.fromkeys(event_ids):
+            statuses.append(self._attempt_one(event_id, sleep_before=False))
+        return statuses
+
     def trigger(
         self,
         event_id: str,
@@ -60,44 +116,11 @@ class CallbackDispatcher:
         payload: dict,
     ) -> dict:
         """幂等触发：首次立即投递一次；重复 event_id 直接返回既有记录。"""
-        import json
-
-        if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > self._max_payload_bytes:
-            raise CallbackPayloadTooLargeError(
-                f"回调载荷超过 {self._max_payload_bytes} 字节", tenant_id=tenant_id
-            )
 
         def _tx(callbacks, audit):
-            existing = callbacks.get(event_id)
-            if existing is not None:
-                return {"record": existing, "duplicate": True}
-            now = self._clock()
-            record = {
-                "event_id": event_id,
-                "tenant_id": tenant_id,
-                "event_type": event_type,
-                "payload": payload,
-                "status": "pending",
-                "attempts": 0,
-                "max_attempts": self._max_attempts,
-                "created_at": now,
-                "updated_at": now,
-                "next_attempt_at": now,
-                "delivered_at": None,
-                "last_error": None,
-                "attempt_log": [],
-            }
-            callbacks.put(event_id, record)
-            if self._audit is not None:
-                eid, entry = make_entry(
-                    "callback_trigger",
-                    tenant_id=tenant_id,
-                    result="state_change",
-                    detail={"event_id": event_id, "event_type": event_type},
-                    clock=self._clock,
-                )
-                audit.put(eid, entry)
-            return {"record": record, "duplicate": False}
+            return self.plan_in_tx(
+                callbacks, audit, event_id, tenant_id, event_type, payload
+            )
 
         result = self._store.atomic(["callbacks", "audit"], _tx)
         if result["duplicate"]:
@@ -183,6 +206,27 @@ class CallbackDispatcher:
 
         self._store.atomic(["callbacks", "audit"], _tx)
         return self.status(event_id)
+
+    def recover_undelivered(self, now: float | None = None, *, grace_seconds: float = 2.0) -> int:
+        """补投事务性 outbox 中“已登记但从未投递过”的事件。
+
+        批量大事务提交成功后、首次投递前进程崩溃时，回调记录停在 pending 且
+        attempts == 0（``run_due_retries`` 只重试投递过至少一次的事件，不会覆盖
+        这种情况）。仅捞 created_at 早于宽限期的事件，避免与正在进行的首次投递
+        并发（实际投递仍由 _attempt_one 的乐观条件保护，不会重复计数）。
+        返回本次补投的事件数。
+        """
+        current = self._clock() if now is None else now
+        stale = [
+            rec["event_id"]
+            for rec in self._coll.list_items()
+            if rec["status"] == "pending"
+            and rec["attempts"] == 0
+            and rec["created_at"] <= current - grace_seconds
+        ]
+        for event_id in stale:
+            self._attempt_one(event_id, sleep_before=False)
+        return len(stale)
 
     def run_due_retries(self, now: float | None = None) -> int:
         """重试所有到点且仍 pending 的事件，返回本次尝试的事件数。"""

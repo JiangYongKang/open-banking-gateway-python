@@ -160,6 +160,9 @@ class Gateway:
         def _loop() -> None:
             while not self._stop.wait(interval):
                 try:
+                    # 先补投事务已提交但首次投递未完成（如进程崩溃）的 outbox 事件，
+                    # 再跑到点的退避重试
+                    self.callbacks.recover_undelivered()
                     self.callbacks.run_due_retries()
                 except Exception:  # 重试线程不能因单条异常死掉
                     log.exception("retry worker iteration failed")

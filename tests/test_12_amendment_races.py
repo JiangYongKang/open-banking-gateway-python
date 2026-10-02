@@ -183,9 +183,12 @@ class CrossProcessIdempotencyTest(unittest.TestCase):
         ids = {o.get("consent_id") for o in outs if o.get("consent_id")}
         assert len(ids) == 1, outs
         fresh = [o for o in outs if o.get("replayed") is False]
-        assert len(fresh) == 1, outs
-        # 另一个要么重放，要么 in_progress；绝不允许第二次创建同意
-        assert all(o.get("code") in (None, "idempotency_in_progress") for o in outs)
+        replays = [o for o in outs if o.get("replayed") is True]
+        # 新语义：落败方不再收到 idempotency_in_progress，而是等待首事务提交后
+        # 直接拿到与首次完全一致的结果
+        assert len(fresh) == 1 and len(replays) == 1, outs
+        assert all("error" not in o for o in outs), outs
+        assert {o["consent_id"] for o in replays} == ids
 
 
 if __name__ == "__main__":

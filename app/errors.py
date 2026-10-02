@@ -173,7 +173,12 @@ class IdempotencyConflictError(GatewayError):
 
 
 class IdempotencyInProgressError(GatewayError):
-    """同一 request_id 的另一请求（通常来自另一进程）仍在处理中。"""
+    """同一 request_id 的另一请求仍在处理中。
+
+    历史错误码：批量整批原子化之后，processing 状态不再持久化，同 request_id
+    的并发落败方会等待首个事务提交并直接拿到首次结果，正常流程不会再抛出此错误；
+    类予以保留仅供旧客户端识别与未来扩展使用。
+    """
 
     code = "idempotency_in_progress"
     status_code = 409

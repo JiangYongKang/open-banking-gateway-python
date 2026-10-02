@@ -175,16 +175,31 @@ POST /t/{tid}/consents/batch            # 需 scope: consents:write
 
 - 幂等作用域为 **租户 + request_id**（不同租户可复用相同字符串）。同一标识重复提交
   **只在首次执行一次**，之后返回与首次**逐字节一致**的逐项结果，且：
-  **不重复扣限流/配额、不重复触发回调、不重复改变状态**（重放请求在限流守卫之前短路）。
-- 同一 `request_id` 但请求内容（动作列表）不同 → `idempotency_conflict` / 409；
-  跨进程同时撞上仍在处理的首请求 → `idempotency_in_progress` / 409（不会执行第二次）。
+  **不重复扣限流/配额、不重复触发回调、不重复改变状态**（重放请求在限流守卫之前短路；
+  并发窗口内落败、首个事务提交后才拿到结果的重放，会自动归还已占的限流占位，同样 0 占用）。
+- 同一 `request_id` 但请求内容（动作列表）不同 → `idempotency_conflict` / 409。
+- **并发唯一执行、落败即结果**：同 request_id 的并发提交（无论同进程多线程还是
+  多进程）真正执行恰好一次；其它请求**不会**收到“处理中/冲突”一类中间态报错，
+  而是等待首个事务落定后直接拿到与首次完全一致的结果。
+- **失败原子性（整批 all-or-nothing）**：整批（占位判定、全部动作、幂等结果记录、
+  回调登记）在**同一个存储事务**（临时文件先全部 staging、再统一原子替换）里提交。
+  若收尾阶段底层存储写入失败，正式文件一个都不会被替换——同意不会被建出/改态、
+  回调不会发出、幂等记录也不会停在“处理中”。用同一个 `request_id` 重试就是一次
+  全新的首次执行，可以正常完成并拿到稳定结果；不存在“业务已经改了、批次没落定”
+  的中间状态。（注：逐项结果里单项业务失败，如操作不存在的同意，属于该动作本身的
+  稳定结果，会和其它成功项一起作为整批结果落定，不属于事务失败。）
+- **回调事务性 outbox**：回调事件在整批事务内只做登记（pending），**事务提交成功
+  之后**才首次投递；事务回滚则回调记录根本不存在、绝不发出；提交成功后即使进程在
+  首次投递前崩溃，后台重试线程也会通过 `recover_undelivered` 自动补投（幂等、不重复）。
 - **逐项独立结果**：响应 `results[]` 每项带 `index / action / ok / consent_id /
   amendment_id / error{code,message}`，并给 `summary{total,succeeded,failed}`。
   单项非法（如对已撤销同意做变更 → `consent_amendment_conflict`、操作不存在的同意 →
   `consent_not_found`、未知动作 → `validation_error`）只让该一项失败并被整体回滚，
   不影响其它项，也**不会留下建了一半/算了一半的残留状态**。
 - 单批最多 100 个动作；整批占用一次业务面限流配额（按接口
-  `POST /consents/batch` 计），而不是按动作条数计；幂等重放占用 0 次。
+  `POST /consents/batch` 计），而不是按动作条数计；任何形式的幂等重放占用 0 次
+  （包括先占后判的并发落败重放——其占位会被归还；事务失败时守卫同样回滚，失败请求
+  本身不消耗配额）。
 - HTTP 层要求 scope `consents:write`；请求级幂等仅适用于该批量端点
   （回调的 `event_id` 幂等仍是各自独立的机制）。
 
@@ -256,13 +271,12 @@ scope_missing`，按时间倒序、默认最近 50 条）以及 `callbacks[]`（
 ## 8. 本地验证方法
 
 ```bash
-# 全部单测（61 个）：异常链路 + 并发竞争 + 多进程幂等 + 真实本地 HTTP 回环
+# 全部单测（69 个）：异常链路 + 并发竞争 + 多进程幂等 + 真实本地 HTTP 回环
 uv run python -m unittest discover -s tests -v
 
-# 只跑本次新增能力
-uv run python -m unittest tests.test_09_consent_amendments \
-    tests.test_10_batch_idempotency tests.test_11_consent_insights \
-    tests.test_12_amendment_races -v
+# 只跑批量幂等与原子性/并发补强
+uv run python -m unittest tests.test_10_batch_idempotency \
+    tests.test_12_amendment_races tests.test_13_batch_atomicity_races -v
 
 # 交互式演示
 ./scripts/demo.sh 8090
@@ -312,6 +326,7 @@ curl -s localhost:8090/t/acme/consents/$CID/insight -H 'X-Tenant-Id: acme' -H "X
 | `tests/test_07_concurrency_idempotency.py` | 并发回调幂等、并发同意授权、uvicorn 本地 HTTP 回环投递 |
 | `tests/test_09_consent_amendments.py` | 变更待生效不误伤、批准原子生效+版本链、撞撤销/到期作废、非法申请 |
 | `tests/test_10_batch_idempotency.py` | 批量部分失败无残留、重放一致不扣额度/不重发回调、并发同批一次、租户作用域 |
+| `tests/test_13_batch_atomicity_races.py` | **批量收尾阶段存储写入失败→整批零生效、同 request_id 重试成功且结果稳定；24 线程/4 进程并发同 request_id 只执行一次且全部拿到首次结果（无 in_progress 中间态）；并发重放 0 配额；失败重试用量只算 1 次；旧版 processing 卡死占位接管；outbox 回调崩溃补投** |
 | `tests/test_11_consent_insights.py` | 放行/拒绝原因视图、关联回调、跨租户 404、纯只读不碰用量与审计 |
 | `tests/test_12_amendment_races.py` | 并发批准单次生效、批准/撤销撞车 20 轮可解释、跨进程 request_id 幂等 |
 

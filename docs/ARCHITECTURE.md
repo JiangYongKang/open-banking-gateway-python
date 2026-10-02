@@ -35,12 +35,24 @@ app/
    进入 REVOKED/EXPIRED 时，终态化事务会同时把其 pending 变更单置 `void`
    （`consents.py` 通过 `amendment_void_hook` 调用 `amendments.void_pending_in_tx`），
    因此“先撤销/到期、后批准”在同一事务里就被否决，新作用域在终态后永不可用。
-4. **批量逐项原子 + 请求级幂等**：每个动作独立事务执行并被 try 隔离，单项失败只回滚该项、
-   不外溢、不留半成品。幂等以「租户 | request_id」为键存入 `idempotency` 集合，分三阶段：
-   独立事务 `claim`（processing 占位）→ 锁外逐项执行 → 独立事务写 `completed` 结果与审计。
-   同 request_id 进程内用每键锁串行，跨进程靠存储中的 processing 标记互斥；
+4. **批量整批原子 + 请求级幂等**：占位判定、全部动作执行、幂等结果记录与回调登记
+   在 **同一个跨集合事务**（consents + amendments + callbacks + audit + idempotency，
+   `store.atomic` 两阶段提交：先把全部集合 stage 成临时文件，再统一原子 rename）里完成。
+   收尾阶段底层存储写入失败（含 fsync/序列化异常）时正式文件一个都不会被替换——
+   同意不建不改、回调不发、幂等记录也不会停在 processing，同 request_id 重试即为
+   全新的首次执行。事务内每项动作跑在自己的深拷贝快照上：成功项的快照逐级累积，
+   失败项仅保留其 denied 审计、业务改动整体丢弃，因此单项失败不污染其它项、无残留。
+   回调采用**事务性 outbox**：事件在大事务内登记为 pending，提交成功后才首次投递；
+   回滚则记录不存在、绝不发出；提交后投递前崩溃由
+   `CallbackDispatcher.recover_undelivered()`（后台重试线程每轮调用）补投。
+   幂等以「租户 | request_id」为键存入 `idempotency` 集合，只持久化 completed 终态；
    指纹（动作列表规范化 JSON 的 SHA-256）不一致返回 `idempotency_conflict`。
-   HTTP 层在限流守卫**之前**先查重，使幂等重放不扣额度、不发回调、不改状态。
+   并发提交同一 request_id 时，进程内由每键锁串行、跨进程由大事务上的 flock 串行，
+   落败方在锁释放后看到的必是 completed 记录，直接返回首次结果，绝不向合作方暴露
+   “处理中/冲突”中间态；旧版本遗留的 processing 卡死占位会被新请求接管重跑。
+   HTTP 层在限流守卫**之前**先查重，使幂等重放不扣额度；并发窗口内先进入守卫、
+   随后才发现自己是落败重放的请求，会在返回前归还限流占位——整批只有首次执行计
+   1 次，任何重放（含并发重放、失败请求）均为 0 占用。
 5. **自助视图纯只读**：`insights.py` 只调用 `Collection.list_items()` 快照读并按 tenant_id
    过滤，跨租户与不存在统一抛 `consent_not_found`；不写审计、不过限流，故不污染用量口径。
 6. **限流原子性**：判定与计数在同一次文件锁事务内；超限分支在追加时间戳之前抛出，
@@ -55,8 +67,10 @@ app/
 | 集合 | 键 | 内容 |
 |---|---|---|
 | `amendments` | `amend-<hex>` | 变更单：状态 pending/approved/void、base/result 快照、extend、版本基号、仅追加 history |
-| `idempotency` | `<tenant>\|<request_id>` | 批量幂等记录：指纹、processing/completed、首次完整逐项结果与摘要 |
+| `idempotency` | `<tenant>\|<request_id>` | 批量幂等记录：指纹、completed 终态（processing 不再持久化）、首次完整逐项结果与摘要 |
+| `callbacks` | `evt-...` | 回调事件（含批量 outbox 登记）：pending/delivered/failed、尝试日志与退避时间 |
 
-`consents` 记录新增 `versions`（旧版本完整快照链）。所有新集合沿用同一套 flock +
-两阶段事务，崩溃时靠 processing 标记防止跨进程重复执行（极端情况会得到
-`idempotency_in_progress` 而不是重复生效）。
+`consents` 记录新增 `versions`（旧版本完整快照链）。所有集合沿用同一套 flock +
+两阶段事务。整批提交把业务集合与 idempotency 结果放进同一个两阶段事务，因此不会
+再出现“业务已生效但批次记录卡在 processing”的中间态；同一 request_id 的并发
+（含跨进程）落败方等待首个事务提交后直接读取 completed 结果。
